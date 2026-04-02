@@ -1,6 +1,7 @@
 streamlit
 pandas
-plotly
+seaborn
 yfinance
 openpyxl
 pyarrow
+matplotlib

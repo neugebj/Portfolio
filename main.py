@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import matplotlib.pyplot as plt
 import pandas as pd
-import plotly.graph_objects as go
+import seaborn as sns
 import streamlit as st
 import yfinance as yf
 
@@ -268,18 +269,6 @@ def compute_relative_return_percent(value_series: pd.Series, invested_series: pd
     return result
 
 
-def add_trace(fig: go.Figure, x, y, name: str, visible: bool = True) -> None:
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=y,
-            mode="lines",
-            name=name,
-            visible=True if visible else "legendonly",
-        )
-    )
-
-
 def format_metric_with_value(relative_pct: float, latest_value: float) -> Tuple[str, str]:
     return f"{relative_pct:,.2f}%", f"{latest_value:,.2f}"
 
@@ -474,23 +463,40 @@ else:
     benchmark_series = history_df["S&P 500 Return (%)"]
     y_axis_title = "Return (%)"
 
-fig = go.Figure()
+sns.set_theme(style="darkgrid")
+
+fig, ax = plt.subplots(figsize=(14, 7))
+fig.patch.set_alpha(0.0)
+ax.set_facecolor("none")
+
 if show_portfolio:
-    add_trace(fig, history_df.index, portfolio_series, "Portfolio", visible=True)
+    sns.lineplot(
+        x=history_df.index,
+        y=portfolio_series,
+        ax=ax,
+        label="Portfolio",
+    )
+
 if show_benchmark:
-    add_trace(fig, history_df.index, benchmark_series, "S&P 500 equivalent", visible=True)
+    sns.lineplot(
+        x=history_df.index,
+        y=benchmark_series,
+        ax=ax,
+        label="S&P 500 equivalent",
+    )
 
-fig.update_layout(
-    template="plotly_dark",
-    height=650,
-    title=f"{APP_TITLE} — {metric_mode}",
-    xaxis_title="Date",
-    yaxis_title=y_axis_title,
-    hovermode="x unified",
-    legend_title="Series",
-)
+ax.set_title(f"{APP_TITLE} — {metric_mode}")
+ax.set_xlabel("Date")
+ax.set_ylabel(y_axis_title)
 
-st.plotly_chart(fig)
+legend = ax.legend(title="Series")
+if legend is not None:
+    legend.get_frame().set_alpha(0.0)
+
+fig.autofmt_xdate()
+plt.tight_layout()
+
+st.pyplot(fig, transparent=True)
 
 # ============================================================
 # Summary metrics
