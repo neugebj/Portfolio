@@ -1,7 +1,7 @@
 streamlit
 pandas
 seaborn
-yfinance==0
+yfinance==0.2.54
 openpyxl
 pyarrow
 matplotlib
