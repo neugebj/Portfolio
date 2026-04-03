@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -156,79 +155,78 @@ def get_incremental_fetch_start(
     return min(requested_start, last_cached - pd.Timedelta(days=overlap_days))
 
 
-def fetch_ticker_history(
-    ticker: str,
+def fetch_tickers_history_batch(
+    tickers: List[str],
     start: pd.Timestamp,
     end: pd.Timestamp,
-    pause_seconds: float = 1,
-) -> pd.DataFrame:
-    stock = yf.Ticker(ticker)
-    hist = stock.history(
+) -> Dict[str, pd.DataFrame]:
+    tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
+    if not tickers:
+        return {}
+
+    hist = yf.download(
+        tickers=tickers,
         start=start.date().isoformat(),
         end=(end + pd.Timedelta(days=1)).date().isoformat(),
         interval="1d",
         auto_adjust=False,
         actions=False,
+        progress=False,
+        group_by="ticker",
+        threads=True,
     )
 
-    time.sleep(pause_seconds)
-
     if hist is None or hist.empty:
-        return pd.DataFrame()
+        return {}
 
-    hist = hist.copy()
-    hist.index = pd.to_datetime(hist.index)
-    if getattr(hist.index, "tz", None) is not None:
-        hist.index = hist.index.tz_localize(None)
-    hist = hist.sort_index()
+    result: Dict[str, pd.DataFrame] = {}
 
-    if "Close" not in hist.columns:
-        return pd.DataFrame()
+    # Multiple tickers: MultiIndex columns
+    if isinstance(hist.columns, pd.MultiIndex):
+        first_level = hist.columns.get_level_values(0)
 
-    hist = hist[["Close"]].copy()
-    hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
-    hist = hist.dropna(subset=["Close"])
-    return hist
+        for ticker in tickers:
+            if ticker not in first_level:
+                continue
 
+            ticker_df = hist[ticker].copy()
+            ticker_df.index = pd.to_datetime(ticker_df.index)
 
-def download_and_update_cache_for_ticker(
-    ticker: str,
-    requested_start: pd.Timestamp,
-    allow_download: bool = True,
-) -> pd.Series:
-    existing = read_cached_close_frame(ticker)
-    requested_start = pd.Timestamp(requested_start).normalize()
+            if getattr(ticker_df.index, "tz", None) is not None:
+                ticker_df.index = ticker_df.index.tz_localize(None)
 
-    frames = []
-    if existing is not None and not existing.empty:
-        frames.append(existing)
+            ticker_df = ticker_df.sort_index()
 
-    if allow_download:
-        fetch_start = get_incremental_fetch_start(existing, requested_start, overlap_days=7)
-        fetch_end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None).normalize() + pd.Timedelta(days=2)
+            if "Close" not in ticker_df.columns:
+                continue
 
-        downloaded = fetch_ticker_history(
-            ticker=ticker,
-            start=fetch_start,
-            end=fetch_end,
-            pause_seconds=1,
-        )
+            ticker_df = ticker_df[["Close"]].copy()
+            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
+            ticker_df = ticker_df.dropna(subset=["Close"])
 
-        if not downloaded.empty:
-            frames.append(downloaded)
+            if not ticker_df.empty:
+                result[ticker] = ticker_df
 
-    if not frames:
-        raise ValueError(f"No Yahoo Finance data returned for ticker '{ticker}'.")
+    # Single ticker: flat columns
+    else:
+        ticker = tickers[0]
+        ticker_df = hist.copy()
+        ticker_df.index = pd.to_datetime(ticker_df.index)
 
-    merged = pd.concat(frames).sort_index()
-    merged = merged[~merged.index.duplicated(keep="last")]
-    merged = merged[merged.index >= requested_start].copy()
+        if getattr(ticker_df.index, "tz", None) is not None:
+            ticker_df.index = ticker_df.index.tz_localize(None)
 
-    if merged.empty:
-        raise ValueError(f"No usable price history available for '{ticker}'.")
+        ticker_df = ticker_df.sort_index()
 
-    merged.to_parquet(cache_file_path(ticker))
-    return merged["Close"].astype(float)
+        if "Close" in ticker_df.columns:
+            ticker_df = ticker_df[["Close"]].copy()
+            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
+            ticker_df = ticker_df.dropna(subset=["Close"])
+
+            if not ticker_df.empty:
+                result[ticker] = ticker_df
+
+    return result
 
 
 def get_price_histories(
@@ -237,14 +235,53 @@ def get_price_histories(
     allow_download: bool = True,
 ) -> Dict[str, pd.Series]:
     tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
+    requested_start = pd.Timestamp(requested_start).normalize()
+
     result: Dict[str, pd.Series] = {}
+    cached_data: Dict[str, Optional[pd.DataFrame]] = {}
 
     for ticker in tickers:
-        result[ticker] = download_and_update_cache_for_ticker(
-            ticker=ticker,
-            requested_start=requested_start,
-            allow_download=allow_download,
+        cached_data[ticker] = read_cached_close_frame(ticker)
+
+    downloaded_map: Dict[str, pd.DataFrame] = {}
+
+    if allow_download:
+        fetch_starts = [
+            get_incremental_fetch_start(cached_data[ticker], requested_start, overlap_days=7)
+            for ticker in tickers
+        ]
+        batch_fetch_start = min(fetch_starts) if fetch_starts else requested_start
+        batch_fetch_end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None).normalize() + pd.Timedelta(days=2)
+
+        downloaded_map = fetch_tickers_history_batch(
+            tickers=tickers,
+            start=batch_fetch_start,
+            end=batch_fetch_end,
         )
+
+    for ticker in tickers:
+        frames = []
+
+        existing = cached_data[ticker]
+        if existing is not None and not existing.empty:
+            frames.append(existing)
+
+        downloaded = downloaded_map.get(ticker)
+        if downloaded is not None and not downloaded.empty:
+            frames.append(downloaded)
+
+        if not frames:
+            raise ValueError(f"No Yahoo Finance data returned for ticker '{ticker}'.")
+
+        merged = pd.concat(frames).sort_index()
+        merged = merged[~merged.index.duplicated(keep="last")]
+        merged = merged[merged.index >= requested_start].copy()
+
+        if merged.empty:
+            raise ValueError(f"No usable price history available for '{ticker}'.")
+
+        merged.to_parquet(cache_file_path(ticker))
+        result[ticker] = merged["Close"].astype(float)
 
     return result
 
@@ -298,8 +335,7 @@ def build_portfolio_and_benchmark(
     benchmark_value = pd.Series(0.0, index=calendar_index, dtype=float)
     invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
     benchmark_invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
-
-    instrument_traces = pd.DataFrame(index=calendar_index)
+    instrument_series = []
     allocation_rows: List[dict] = []
 
     spx_prices_full = price_map[SP500_TICKER].reindex(calendar_index).ffill()
@@ -332,8 +368,11 @@ def build_portfolio_and_benchmark(
         bench_invested_component.loc[bench_invested_component.index >= bench_alloc_date] = purchase_value
         benchmark_invested_capital = benchmark_invested_capital.add(bench_invested_component, fill_value=0.0)
 
-        instrument_traces[f"{xtb_symbol} ({position_id})"] = asset_component
-        instrument_traces[f"S&P for {xtb_symbol} ({position_id})"] = bench_component
+        asset_component.name = f"{xtb_symbol} ({position_id})"
+        bench_component.name = f"S&P for {xtb_symbol} ({position_id})"
+
+        instrument_series.append(asset_component)
+        instrument_series.append(bench_component)
 
         allocation_rows.append(
             {
@@ -347,6 +386,8 @@ def build_portfolio_and_benchmark(
                 "Benchmark units": bench_units,
             }
         )
+
+    instrument_traces = pd.concat(instrument_series, axis=1)
 
     result = pd.DataFrame(
         {
@@ -393,7 +434,7 @@ st.markdown(
 st.title(APP_TITLE)
 st.caption(
     "Reads currently open positions from the XTB export, downloads daily Yahoo Finance closes "
-    "ticker-by-ticker, caches them locally, and compares the portfolio with an S&P 500 investment "
+    "in batch with yf.download, caches them locally, and compares the portfolio with an S&P 500 investment "
     "made on each position's open date."
 )
 
@@ -452,6 +493,13 @@ if history_df is None or history_df.empty:
     st.warning("No time series could be built from the available positions and market data.")
     st.stop()
 
+
+# -------------------------------------------------
+# Detect theme
+# -------------------------------------------------
+
+text_color = "white"
+
 value_mode = metric_mode == "Portfolio value"
 
 if value_mode:
@@ -463,7 +511,10 @@ else:
     benchmark_series = history_df["S&P 500 Return (%)"]
     y_axis_title = "Return (%)"
 
-sns.set_theme(style="darkgrid")
+# -------------------------------------------------
+# Seaborn setup without grid
+# -------------------------------------------------
+sns.set_theme(style="white")
 
 fig, ax = plt.subplots(figsize=(14, 7))
 fig.patch.set_alpha(0.0)
@@ -485,18 +536,26 @@ if show_benchmark:
         label="S&P 500 equivalent",
     )
 
-ax.set_title(f"{APP_TITLE} — {metric_mode}")
-ax.set_xlabel("Date")
-ax.set_ylabel(y_axis_title)
+ax.set_title(f"{APP_TITLE} — {metric_mode}", color=text_color)
+ax.set_xlabel("Date", color=text_color)
+ax.set_ylabel(y_axis_title, color=text_color)
+
+ax.tick_params(colors=text_color)
+
+for spine in ax.spines.values():
+    spine.set_color(text_color)
 
 legend = ax.legend(title="Series")
 if legend is not None:
     legend.get_frame().set_alpha(0.0)
+    plt.setp(legend.get_texts(), color=text_color)
+    plt.setp(legend.get_title(), color=text_color)
 
 fig.autofmt_xdate()
 plt.tight_layout()
 
 st.pyplot(fig, transparent=True)
+
 
 # ============================================================
 # Summary metrics
@@ -531,11 +590,9 @@ with c4:
         delta=f"{benchmark_return_pct:,.2f}%",
     )
 
-
 st.info(
     "Notes: Portfolio history is reconstructed from the currently open positions only. "
     "Return (%) is calculated relative to cumulative invested capital available at each date. "
     "The benchmark invests the same purchase value for each position into the S&P 500 at that day's close. "
-    "If that date is not a US trading day, the next available S&P 500 close is used. "
-    "In the instrument-level chart, click legend items to show or hide individual lines."
+    "If that date is not a US trading day, the next available S&P 500 close is used."
 )
