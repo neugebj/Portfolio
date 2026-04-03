@@ -11,6 +11,7 @@ import seaborn as sns
 import streamlit as st
 import yfinance as yf
 
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -159,7 +160,7 @@ def fetch_ticker_history(
     ticker: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
-    pause_seconds: float = 0.6,
+    pause_seconds: float = 1,
 ) -> pd.DataFrame:
     stock = yf.Ticker(ticker)
     hist = stock.history(
@@ -529,7 +530,6 @@ with c4:
         f"{benchmark_last:,.2f}",
         delta=f"{benchmark_return_pct:,.2f}%",
     )
-
 
 
 st.info(
