@@ -11,7 +11,6 @@ import seaborn as sns
 import streamlit as st
 import yfinance as yf
 
-
 # ============================================================
 # Configuration
 # ============================================================
