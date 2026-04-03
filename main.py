@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -52,8 +53,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def find_open_positions_sheet(excel_path: str) -> str:
-    xls = pd.ExcelFile(excel_path)
+def load_excel_bytes_from_path(path_str: str) -> bytes:
+    return Path(path_str).read_bytes()
+
+
+@st.cache_data(show_spinner=False)
+def find_open_positions_sheet(file_bytes: bytes) -> str:
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
     for sheet in xls.sheet_names:
         if str(sheet).strip().upper().startswith("OPEN POSITION"):
             return sheet
@@ -73,9 +79,9 @@ def xtb_to_yahoo_symbol(symbol: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def load_positions(excel_path: str) -> pd.DataFrame:
-    sheet_name = find_open_positions_sheet(excel_path)
-    raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=10)
+def load_positions(file_bytes: bytes) -> pd.DataFrame:
+    sheet_name = find_open_positions_sheet(file_bytes)
+    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=10)
     raw = normalize_columns(raw)
 
     required = [
@@ -181,7 +187,6 @@ def fetch_tickers_history_batch(
 
     result: Dict[str, pd.DataFrame] = {}
 
-    # Multiple tickers: MultiIndex columns
     if isinstance(hist.columns, pd.MultiIndex):
         first_level = hist.columns.get_level_values(0)
 
@@ -206,8 +211,6 @@ def fetch_tickers_history_batch(
 
             if not ticker_df.empty:
                 result[ticker] = ticker_df
-
-    # Single ticker: flat columns
     else:
         ticker = tickers[0]
         ticker_df = hist.copy()
@@ -306,16 +309,10 @@ def compute_relative_return_percent(value_series: pd.Series, invested_series: pd
     return result
 
 
-def format_metric_with_value(relative_pct: float, latest_value: float) -> Tuple[str, str]:
-    return f"{relative_pct:,.2f}%", f"{latest_value:,.2f}"
-
-
-# ============================================================
-# Core build
-# ============================================================
-def build_portfolio_and_benchmark(
+@st.cache_data(show_spinner=False)
+def build_portfolio_and_benchmark_cached(
     positions_df: pd.DataFrame,
-    allow_download: bool = True,
+    allow_download: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     overall_start = positions_df["Open date"].min().normalize()
     all_tickers = sorted(set(positions_df["Yahoo Symbol"].tolist() + [SP500_TICKER]))
@@ -411,6 +408,71 @@ def build_portfolio_and_benchmark(
     return result, instrument_traces
 
 
+@st.cache_data(show_spinner=False)
+def render_plot_png(
+    history_df: pd.DataFrame,
+    metric_mode: str,
+    show_portfolio: bool,
+    show_benchmark: bool,
+    text_color: str,
+) -> bytes:
+    value_mode = metric_mode == "Portfolio value"
+
+    if value_mode:
+        portfolio_series = history_df["Portfolio Value"]
+        benchmark_series = history_df["S&P 500 Equivalent"]
+        y_axis_title = "Value"
+    else:
+        portfolio_series = history_df["Portfolio Return (%)"]
+        benchmark_series = history_df["S&P 500 Return (%)"]
+        y_axis_title = "Return (%)"
+
+    sns.set_theme(style="white")
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
+
+    if show_portfolio:
+        sns.lineplot(
+            x=history_df.index,
+            y=portfolio_series,
+            ax=ax,
+            label="Portfolio",
+        )
+
+    if show_benchmark:
+        sns.lineplot(
+            x=history_df.index,
+            y=benchmark_series,
+            ax=ax,
+            label="S&P 500 equivalent",
+        )
+
+    ax.set_title(f"{APP_TITLE} — {metric_mode}", color=text_color)
+    ax.set_xlabel("Date", color=text_color)
+    ax.set_ylabel(y_axis_title, color=text_color)
+    ax.tick_params(colors=text_color)
+
+    for spine in ax.spines.values():
+        spine.set_color(text_color)
+
+    legend = ax.legend(title="Series")
+    if legend is not None:
+        legend.get_frame().set_alpha(0.0)
+        plt.setp(legend.get_texts(), color=text_color)
+        plt.setp(legend.get_title(), color=text_color)
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, transparent=True, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ============================================================
 # Streamlit UI
 # ============================================================
@@ -439,6 +501,12 @@ st.caption(
 )
 
 with st.sidebar:
+    uploaded_file = st.file_uploader(
+        "Upload XTB Excel file",
+        type=["xlsx", "xls"],
+        help="Upload the XTB export containing a sheet whose name starts with 'OPEN POSITION'.",
+    )
+
     metric_mode = st.radio(
         "Display mode",
         options=["Portfolio value", "Return (%)"],
@@ -449,14 +517,34 @@ with st.sidebar:
     show_benchmark = st.checkbox("Show S&P 500 equivalent", value=True)
 
     refresh_prices = st.button("Refresh market data")
+    clear_cache = st.button("Clear all caches")
 
-excel_file = Path(DEFAULT_EXCEL_PATH)
-if not excel_file.exists():
-    st.error(f"Excel file was not found: {excel_file.resolve() if excel_file.is_absolute() else excel_file}")
-    st.stop()
+if clear_cache:
+    st.cache_data.clear()
+    st.success("Streamlit cache cleared.")
+
+file_bytes: Optional[bytes] = None
+file_name_to_show = None
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    file_name_to_show = uploaded_file.name
+else:
+    excel_file = Path(DEFAULT_EXCEL_PATH)
+    if excel_file.exists():
+        file_bytes = load_excel_bytes_from_path(str(excel_file))
+        file_name_to_show = str(excel_file)
+    else:
+        st.error(
+            "No file uploaded and default Excel file was not found. "
+            f"Expected default file: {excel_file.resolve() if excel_file.is_absolute() else excel_file}"
+        )
+        st.stop()
+
+st.sidebar.caption(f"Using file: {file_name_to_show}")
 
 try:
-    positions_df = load_positions(str(excel_file))
+    positions_df = load_positions(file_bytes)
 except Exception as e:
     st.exception(e)
     st.stop()
@@ -465,29 +553,15 @@ if positions_df.empty:
     st.warning("No BUY/LONG open positions were found in the selected workbook.")
     st.stop()
 
-history_df = None
-instrument_df = None
-
-if refresh_prices:
-    try:
-        with st.spinner("Downloading and updating cached prices...", show_time=True):
-            history_df, instrument_df = build_portfolio_and_benchmark(
-                positions_df,
-                allow_download=True,
-            )
-        st.session_state["history_df"] = history_df
-        st.session_state["instrument_df"] = instrument_df
-        st.success("Market data refreshed.")
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-else:
-    if "history_df" in st.session_state and "instrument_df" in st.session_state:
-        history_df = st.session_state["history_df"]
-        instrument_df = st.session_state["instrument_df"]
-    else:
-        st.info("Click 'Refresh market data' in the sidebar to load Yahoo prices.")
-        st.stop()
+try:
+    with st.spinner("Building portfolio history...", show_time=True):
+        history_df, instrument_df = build_portfolio_and_benchmark_cached(
+            positions_df=positions_df,
+            allow_download=refresh_prices,
+        )
+except Exception as e:
+    st.exception(e)
+    st.stop()
 
 if history_df is None or history_df.empty:
     st.warning("No time series could be built from the available positions and market data.")
@@ -495,66 +569,19 @@ if history_df is None or history_df.empty:
 
 
 # -------------------------------------------------
-# Detect theme
+# Plot
 # -------------------------------------------------
-
 text_color = "white"
 
-value_mode = metric_mode == "Portfolio value"
+plot_png = render_plot_png(
+    history_df=history_df,
+    metric_mode=metric_mode,
+    show_portfolio=show_portfolio,
+    show_benchmark=show_benchmark,
+    text_color=text_color,
+)
 
-if value_mode:
-    portfolio_series = history_df["Portfolio Value"]
-    benchmark_series = history_df["S&P 500 Equivalent"]
-    y_axis_title = "Value"
-else:
-    portfolio_series = history_df["Portfolio Return (%)"]
-    benchmark_series = history_df["S&P 500 Return (%)"]
-    y_axis_title = "Return (%)"
-
-# -------------------------------------------------
-# Seaborn setup without grid
-# -------------------------------------------------
-sns.set_theme(style="white")
-
-fig, ax = plt.subplots(figsize=(14, 7))
-fig.patch.set_alpha(0.0)
-ax.set_facecolor("none")
-
-if show_portfolio:
-    sns.lineplot(
-        x=history_df.index,
-        y=portfolio_series,
-        ax=ax,
-        label="Portfolio",
-    )
-
-if show_benchmark:
-    sns.lineplot(
-        x=history_df.index,
-        y=benchmark_series,
-        ax=ax,
-        label="S&P 500 equivalent",
-    )
-
-ax.set_title(f"{APP_TITLE} — {metric_mode}", color=text_color)
-ax.set_xlabel("Date", color=text_color)
-ax.set_ylabel(y_axis_title, color=text_color)
-
-ax.tick_params(colors=text_color)
-
-for spine in ax.spines.values():
-    spine.set_color(text_color)
-
-legend = ax.legend(title="Series")
-if legend is not None:
-    legend.get_frame().set_alpha(0.0)
-    plt.setp(legend.get_texts(), color=text_color)
-    plt.setp(legend.get_title(), color=text_color)
-
-fig.autofmt_xdate()
-plt.tight_layout()
-
-st.pyplot(fig, transparent=True)
+st.image(plot_png, use_container_width=True)
 
 
 # ============================================================
