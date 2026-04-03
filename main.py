@@ -10,12 +10,12 @@ import seaborn as sns
 import streamlit as st
 import yfinance as yf
 
+
 # ============================================================
 # Configuration
 # ============================================================
 APP_TITLE = "XTB Open Positions vs S&P 500"
 DEFAULT_EXCEL_PATH = "xtb_transactions.xlsx"
-
 CACHE_DIR = Path("cache_price_data")
 CACHE_DIR.mkdir(exist_ok=True)
 
@@ -57,7 +57,7 @@ def find_open_positions_sheet(excel_path: str) -> str:
     for sheet in xls.sheet_names:
         if str(sheet).strip().upper().startswith("OPEN POSITION"):
             return sheet
-    raise ValueError("No sheet starting with 'OPEN POSITION' was found.")
+    raise ValueError("No sheet starting with 'OPEN POSITION' was found in the workbook.")
 
 
 def xtb_to_yahoo_symbol(symbol: str) -> str:
@@ -75,22 +75,25 @@ def xtb_to_yahoo_symbol(symbol: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_positions(excel_path: str) -> pd.DataFrame:
     sheet_name = find_open_positions_sheet(excel_path)
-
     raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=10)
     raw = normalize_columns(raw)
 
     required = [
-        "Position", "Symbol", "Type", "Volume",
-        "Open time", "Open price", "Purchase value",
+        "Position",
+        "Symbol",
+        "Type",
+        "Volume",
+        "Open time",
+        "Open price",
+        "Purchase value",
     ]
-
     missing = [c for c in required if c not in raw.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}")
+        raise ValueError(f"Missing expected columns in Excel sheet: {missing}")
 
     df = raw[required].copy()
-    df = df[df["Symbol"].notna()]
-    df = df[df["Volume"].notna()]
+    df = df[df["Symbol"].notna()].copy()
+    df = df[df["Volume"].notna()].copy()
 
     df["Type"] = df["Type"].astype(str).str.upper().str.strip()
     df = df[df["Type"].isin(["BUY", "LONG"])]
@@ -101,7 +104,7 @@ def load_positions(excel_path: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["Open time", "Volume", "Open price", "Purchase value"])
-    df = df[df["Volume"] > 0]
+    df = df[df["Volume"] > 0].copy()
 
     df["Yahoo Symbol"] = df["Symbol"].apply(xtb_to_yahoo_symbol)
     df["Open date"] = df["Open time"].dt.normalize()
@@ -121,13 +124,10 @@ def read_cached_close_frame(ticker: str) -> Optional[pd.DataFrame]:
 
     try:
         df = pd.read_parquet(cache_path)
-
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
-
         if getattr(df.index, "tz", None) is not None:
             df.index = df.index.tz_localize(None)
-
         df = df.sort_index()
 
         if "Close" not in df.columns:
@@ -136,14 +136,16 @@ def read_cached_close_frame(ticker: str) -> Optional[pd.DataFrame]:
         df = df[["Close"]].copy()
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
         df = df.dropna(subset=["Close"])
-
         return df
-
     except Exception:
         return None
 
 
-def get_incremental_fetch_start(existing, requested_start, overlap_days=7):
+def get_incremental_fetch_start(
+    existing: Optional[pd.DataFrame],
+    requested_start: pd.Timestamp,
+    overlap_days: int = 7,
+) -> pd.Timestamp:
     requested_start = pd.Timestamp(requested_start).normalize()
 
     if existing is None or existing.empty:
@@ -153,8 +155,12 @@ def get_incremental_fetch_start(existing, requested_start, overlap_days=7):
     return min(requested_start, last_cached - pd.Timedelta(days=overlap_days))
 
 
-def fetch_tickers_history_batch(tickers, start, end):
-    tickers = sorted(set(tickers))
+def fetch_tickers_history_batch(
+    tickers: List[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> Dict[str, pd.DataFrame]:
+    tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
     if not tickers:
         return {}
 
@@ -163,103 +169,430 @@ def fetch_tickers_history_batch(tickers, start, end):
         start=start.date().isoformat(),
         end=(end + pd.Timedelta(days=1)).date().isoformat(),
         interval="1d",
+        auto_adjust=False,
+        actions=False,
+        progress=False,
         group_by="ticker",
         threads=True,
-        progress=False,
     )
 
-    result = {}
+    if hist is None or hist.empty:
+        return {}
 
+    result: Dict[str, pd.DataFrame] = {}
+
+    # Multiple tickers: MultiIndex columns
     if isinstance(hist.columns, pd.MultiIndex):
+        first_level = hist.columns.get_level_values(0)
+
         for ticker in tickers:
-            if ticker not in hist.columns.get_level_values(0):
+            if ticker not in first_level:
                 continue
 
-            df = hist[ticker][["Close"]].dropna()
-            result[ticker] = df
+            ticker_df = hist[ticker].copy()
+            ticker_df.index = pd.to_datetime(ticker_df.index)
 
+            if getattr(ticker_df.index, "tz", None) is not None:
+                ticker_df.index = ticker_df.index.tz_localize(None)
+
+            ticker_df = ticker_df.sort_index()
+
+            if "Close" not in ticker_df.columns:
+                continue
+
+            ticker_df = ticker_df[["Close"]].copy()
+            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
+            ticker_df = ticker_df.dropna(subset=["Close"])
+
+            if not ticker_df.empty:
+                result[ticker] = ticker_df
+
+    # Single ticker: flat columns
     else:
         ticker = tickers[0]
-        result[ticker] = hist[["Close"]].dropna()
+        ticker_df = hist.copy()
+        ticker_df.index = pd.to_datetime(ticker_df.index)
+
+        if getattr(ticker_df.index, "tz", None) is not None:
+            ticker_df.index = ticker_df.index.tz_localize(None)
+
+        ticker_df = ticker_df.sort_index()
+
+        if "Close" in ticker_df.columns:
+            ticker_df = ticker_df[["Close"]].copy()
+            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
+            ticker_df = ticker_df.dropna(subset=["Close"])
+
+            if not ticker_df.empty:
+                result[ticker] = ticker_df
 
     return result
 
 
-# ============================================================
-# Core
-# ============================================================
-def build_portfolio_and_benchmark(positions_df):
-    overall_start = positions_df["Open date"].min()
+def get_price_histories(
+    tickers: List[str],
+    requested_start: pd.Timestamp,
+    allow_download: bool = True,
+) -> Dict[str, pd.Series]:
+    tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
+    requested_start = pd.Timestamp(requested_start).normalize()
 
-    tickers = list(set(positions_df["Yahoo Symbol"].tolist() + [SP500_TICKER]))
+    result: Dict[str, pd.Series] = {}
+    cached_data: Dict[str, Optional[pd.DataFrame]] = {}
 
-    price_map = fetch_tickers_history_batch(
-        tickers,
-        start=overall_start,
-        end=pd.Timestamp.today(),
+    for ticker in tickers:
+        cached_data[ticker] = read_cached_close_frame(ticker)
+
+    downloaded_map: Dict[str, pd.DataFrame] = {}
+
+    if allow_download:
+        fetch_starts = [
+            get_incremental_fetch_start(cached_data[ticker], requested_start, overlap_days=7)
+            for ticker in tickers
+        ]
+        batch_fetch_start = min(fetch_starts) if fetch_starts else requested_start
+        batch_fetch_end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None).normalize() + pd.Timedelta(days=2)
+
+        downloaded_map = fetch_tickers_history_batch(
+            tickers=tickers,
+            start=batch_fetch_start,
+            end=batch_fetch_end,
+        )
+
+    for ticker in tickers:
+        frames = []
+
+        existing = cached_data[ticker]
+        if existing is not None and not existing.empty:
+            frames.append(existing)
+
+        downloaded = downloaded_map.get(ticker)
+        if downloaded is not None and not downloaded.empty:
+            frames.append(downloaded)
+
+        if not frames:
+            raise ValueError(f"No Yahoo Finance data returned for ticker '{ticker}'.")
+
+        merged = pd.concat(frames).sort_index()
+        merged = merged[~merged.index.duplicated(keep="last")]
+        merged = merged[merged.index >= requested_start].copy()
+
+        if merged.empty:
+            raise ValueError(f"No usable price history available for '{ticker}'.")
+
+        merged.to_parquet(cache_file_path(ticker))
+        result[ticker] = merged["Close"].astype(float)
+
+    return result
+
+
+def align_on_or_after(series: pd.Series, target_date: pd.Timestamp) -> Tuple[pd.Timestamp, float]:
+    target_date = pd.Timestamp(target_date).normalize()
+    eligible = series[series.index >= target_date]
+    if eligible.empty:
+        raise ValueError(f"No benchmark price available on or after {target_date.date()} for allocation.")
+    alloc_date = pd.Timestamp(eligible.index[0]).normalize()
+    alloc_price = float(eligible.iloc[0])
+    return alloc_date, alloc_price
+
+
+def compute_relative_return_percent(value_series: pd.Series, invested_series: pd.Series) -> pd.Series:
+    invested = invested_series.astype(float)
+    value = value_series.astype(float)
+
+    result = pd.Series(0.0, index=value.index, dtype=float)
+    mask = invested > 0
+    result.loc[mask] = (value.loc[mask] / invested.loc[mask] - 1.0) * 100.0
+    return result
+
+
+def format_metric_with_value(relative_pct: float, latest_value: float) -> Tuple[str, str]:
+    return f"{relative_pct:,.2f}%", f"{latest_value:,.2f}"
+
+
+# ============================================================
+# Core build
+# ============================================================
+def build_portfolio_and_benchmark(
+    positions_df: pd.DataFrame,
+    allow_download: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    overall_start = positions_df["Open date"].min().normalize()
+    all_tickers = sorted(set(positions_df["Yahoo Symbol"].tolist() + [SP500_TICKER]))
+
+    price_map = get_price_histories(
+        tickers=all_tickers,
+        requested_start=overall_start,
+        allow_download=allow_download,
     )
 
-    calendar = price_map[SP500_TICKER].index
+    calendar_index = price_map[SP500_TICKER].index
+    for series in price_map.values():
+        calendar_index = calendar_index.union(series.index)
+    calendar_index = calendar_index.sort_values()
 
-    portfolio = pd.Series(0.0, index=calendar)
-    benchmark = pd.Series(0.0, index=calendar)
+    portfolio_value = pd.Series(0.0, index=calendar_index, dtype=float)
+    benchmark_value = pd.Series(0.0, index=calendar_index, dtype=float)
+    invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
+    benchmark_invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
+    instrument_series = []
+    allocation_rows: List[dict] = []
+
+    spx_prices_full = price_map[SP500_TICKER].reindex(calendar_index).ffill()
 
     for _, row in positions_df.iterrows():
-        ticker = row["Yahoo Symbol"]
-        open_date = row["Open date"]
-        volume = row["Volume"]
-        purchase = row["Purchase value"]
+        position_id = str(row["Position"])
+        xtb_symbol = str(row["Symbol"])
+        ticker = str(row["Yahoo Symbol"])
+        open_date = pd.Timestamp(row["Open date"]).normalize()
+        volume = float(row["Volume"])
+        purchase_value = float(row["Purchase value"])
 
-        prices = price_map[ticker]["Close"].reindex(calendar).ffill()
-        component = prices * volume
-        component[component.index < open_date] = 0
+        asset_prices = price_map[ticker].reindex(calendar_index).ffill()
+        asset_component = asset_prices * volume
+        asset_component.loc[asset_component.index < open_date] = 0.0
+        portfolio_value = portfolio_value.add(asset_component, fill_value=0.0)
 
-        portfolio += component
+        invested_component = pd.Series(0.0, index=calendar_index, dtype=float)
+        invested_component.loc[invested_component.index >= open_date] = purchase_value
+        invested_capital = invested_capital.add(invested_component, fill_value=0.0)
 
-        spx = price_map[SP500_TICKER]["Close"]
-        alloc_date = spx.index[spx.index >= open_date][0]
-        units = purchase / spx.loc[alloc_date]
+        bench_alloc_date, bench_alloc_price = align_on_or_after(price_map[SP500_TICKER], open_date)
+        bench_units = purchase_value / bench_alloc_price
 
-        bench = spx.reindex(calendar).ffill() * units
-        bench[bench.index < alloc_date] = 0
+        bench_component = spx_prices_full * bench_units
+        bench_component.loc[bench_component.index < bench_alloc_date] = 0.0
+        benchmark_value = benchmark_value.add(bench_component, fill_value=0.0)
 
-        benchmark += bench
+        bench_invested_component = pd.Series(0.0, index=calendar_index, dtype=float)
+        bench_invested_component.loc[bench_invested_component.index >= bench_alloc_date] = purchase_value
+        benchmark_invested_capital = benchmark_invested_capital.add(bench_invested_component, fill_value=0.0)
 
-    df = pd.DataFrame({
-        "Portfolio Value": portfolio,
-        "S&P 500 Equivalent": benchmark,
-    })
+        asset_component.name = f"{xtb_symbol} ({position_id})"
+        bench_component.name = f"S&P for {xtb_symbol} ({position_id})"
 
-    return df
+        instrument_series.append(asset_component)
+        instrument_series.append(bench_component)
+
+        allocation_rows.append(
+            {
+                "Position": position_id,
+                "XTB Symbol": xtb_symbol,
+                "Yahoo Symbol": ticker,
+                "Open date": open_date.date().isoformat(),
+                "Purchase value": purchase_value,
+                "Benchmark allocation date": bench_alloc_date.date().isoformat(),
+                "Benchmark allocation close": round(bench_alloc_price, 6),
+                "Benchmark units": bench_units,
+            }
+        )
+
+    instrument_traces = pd.concat(instrument_series, axis=1)
+
+    result = pd.DataFrame(
+        {
+            "Portfolio Value": portfolio_value,
+            "S&P 500 Equivalent": benchmark_value,
+            "Portfolio Invested": invested_capital,
+            "S&P 500 Invested": benchmark_invested_capital,
+        }
+    ).sort_index()
+
+    result["Portfolio Return (%)"] = compute_relative_return_percent(
+        result["Portfolio Value"],
+        result["Portfolio Invested"],
+    )
+    result["S&P 500 Return (%)"] = compute_relative_return_percent(
+        result["S&P 500 Equivalent"],
+        result["S&P 500 Invested"],
+    )
+
+    allocation_df = pd.DataFrame(allocation_rows)
+    return result, instrument_traces
 
 
 # ============================================================
-# UI
+# Streamlit UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background-color: #0e1117;
+            color: #fafafa;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #111827;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title(APP_TITLE)
+st.caption(
+    "Reads currently open positions from the XTB export, downloads daily Yahoo Finance closes "
+    "in batch with yf.download, caches them locally, and compares the portfolio with an S&P 500 investment "
+    "made on each position's open date."
+)
+
+with st.sidebar:
+    metric_mode = st.radio(
+        "Display mode",
+        options=["Portfolio value", "Return (%)"],
+        index=0,
+    )
+
+    show_portfolio = st.checkbox("Show portfolio", value=True)
+    show_benchmark = st.checkbox("Show S&P 500 equivalent", value=True)
+
+    refresh_prices = st.button("Refresh market data")
 
 excel_file = Path(DEFAULT_EXCEL_PATH)
-
 if not excel_file.exists():
-    st.error("Excel file not found")
+    st.error(f"Excel file was not found: {excel_file.resolve() if excel_file.is_absolute() else excel_file}")
     st.stop()
 
-positions_df = load_positions(str(excel_file))
+try:
+    positions_df = load_positions(str(excel_file))
+except Exception as e:
+    st.exception(e)
+    st.stop()
 
-history_df = build_portfolio_and_benchmark(positions_df)
+if positions_df.empty:
+    st.warning("No BUY/LONG open positions were found in the selected workbook.")
+    st.stop()
 
+history_df = None
+instrument_df = None
+
+if refresh_prices:
+    try:
+        with st.spinner("Downloading and updating cached prices...", show_time=True):
+            history_df, instrument_df = build_portfolio_and_benchmark(
+                positions_df,
+                allow_download=True,
+            )
+        st.session_state["history_df"] = history_df
+        st.session_state["instrument_df"] = instrument_df
+        st.success("Market data refreshed.")
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+else:
+    if "history_df" in st.session_state and "instrument_df" in st.session_state:
+        history_df = st.session_state["history_df"]
+        instrument_df = st.session_state["instrument_df"]
+    else:
+        st.info("Click 'Refresh market data' in the sidebar to load Yahoo prices.")
+        st.stop()
+
+if history_df is None or history_df.empty:
+    st.warning("No time series could be built from the available positions and market data.")
+    st.stop()
+
+
+# -------------------------------------------------
+# Detect theme
+# -------------------------------------------------
+
+text_color = "white"
+
+value_mode = metric_mode == "Portfolio value"
+
+if value_mode:
+    portfolio_series = history_df["Portfolio Value"]
+    benchmark_series = history_df["S&P 500 Equivalent"]
+    y_axis_title = "Value"
+else:
+    portfolio_series = history_df["Portfolio Return (%)"]
+    benchmark_series = history_df["S&P 500 Return (%)"]
+    y_axis_title = "Return (%)"
+
+# -------------------------------------------------
+# Seaborn setup without grid
+# -------------------------------------------------
 sns.set_theme(style="white")
 
 fig, ax = plt.subplots(figsize=(14, 7))
 fig.patch.set_alpha(0.0)
 ax.set_facecolor("none")
 
-sns.lineplot(x=history_df.index, y=history_df["Portfolio Value"], ax=ax, label="Portfolio")
-sns.lineplot(x=history_df.index, y=history_df["S&P 500 Equivalent"], ax=ax, label="S&P 500")
+if show_portfolio:
+    sns.lineplot(
+        x=history_df.index,
+        y=portfolio_series,
+        ax=ax,
+        label="Portfolio",
+    )
 
-ax.set_title(APP_TITLE)
-ax.set_xlabel("Date")
-ax.set_ylabel("Value")
+if show_benchmark:
+    sns.lineplot(
+        x=history_df.index,
+        y=benchmark_series,
+        ax=ax,
+        label="S&P 500 equivalent",
+    )
+
+ax.set_title(f"{APP_TITLE} — {metric_mode}", color=text_color)
+ax.set_xlabel("Date", color=text_color)
+ax.set_ylabel(y_axis_title, color=text_color)
+
+ax.tick_params(colors=text_color)
+
+for spine in ax.spines.values():
+    spine.set_color(text_color)
+
+legend = ax.legend(title="Series")
+if legend is not None:
+    legend.get_frame().set_alpha(0.0)
+    plt.setp(legend.get_texts(), color=text_color)
+    plt.setp(legend.get_title(), color=text_color)
+
+fig.autofmt_xdate()
+plt.tight_layout()
 
 st.pyplot(fig, transparent=True)
+
+
+# ============================================================
+# Summary metrics
+# ============================================================
+c1, c2, c3, c4 = st.columns(4)
+
+portfolio_invested = float(history_df["Portfolio Invested"].iloc[-1])
+benchmark_invested = float(history_df["S&P 500 Invested"].iloc[-1])
+portfolio_last = float(history_df["Portfolio Value"].iloc[-1])
+benchmark_last = float(history_df["S&P 500 Equivalent"].iloc[-1])
+
+portfolio_return_pct = float(history_df["Portfolio Return (%)"].iloc[-1]) if portfolio_invested > 0 else 0.0
+benchmark_return_pct = float(history_df["S&P 500 Return (%)"].iloc[-1]) if benchmark_invested > 0 else 0.0
+
+with c1:
+    st.metric("Portfolio total invested", f"{portfolio_invested:,.2f}")
+
+with c2:
+    st.metric(
+        "Portfolio latest value",
+        f"{portfolio_last:,.2f}",
+        delta=f"{portfolio_return_pct:,.2f}%",
+    )
+
+with c3:
+    st.metric("S&P 500 total invested", f"{benchmark_invested:,.2f}")
+
+with c4:
+    st.metric(
+        "S&P 500 latest value",
+        f"{benchmark_last:,.2f}",
+        delta=f"{benchmark_return_pct:,.2f}%",
+    )
+
+st.info(
+    "Notes: Portfolio history is reconstructed from the currently open positions only. "
+    "Return (%) is calculated relative to cumulative invested capital available at each date. "
+    "The benchmark invests the same purchase value for each position into the S&P 500 at that day's close. "
+    "If that date is not a US trading day, the next available S&P 500 close is used."
+)
