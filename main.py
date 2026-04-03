@@ -128,69 +128,133 @@ def fetch_tickers_history_batch_cached(
 ) -> Dict[str, pd.DataFrame]:
     """
     Cached Yahoo download for Streamlit Cloud.
-    refresh_nonce changes only when the user clicks refresh.
+    Falls back to single-ticker downloads for missing symbols, especially ^GSPC.
     """
-    hist = yf.download(
-        tickers=list(tickers),
-        start=start_iso,
-        end=end_iso,
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-    )
-
-    if hist is None or hist.empty:
+    tickers = tuple(sorted(set(str(t).strip() for t in tickers if str(t).strip())))
+    if not tickers:
         return {}
 
-    result: Dict[str, pd.DataFrame] = {}
+    def _normalize_single_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if df is None or df.empty:
+            return None
 
-    if isinstance(hist.columns, pd.MultiIndex):
-        first_level = hist.columns.get_level_values(0)
-        for ticker in tickers:
-            if ticker not in first_level:
-                continue
+        out = df.copy()
+        out.index = pd.to_datetime(out.index)
 
-            ticker_df = hist[ticker].copy()
-            ticker_df.index = pd.to_datetime(ticker_df.index)
+        if getattr(out.index, "tz", None) is not None:
+            out.index = out.index.tz_localize(None)
 
-            if getattr(ticker_df.index, "tz", None) is not None:
-                ticker_df.index = ticker_df.index.tz_localize(None)
+        out = out.sort_index()
 
-            ticker_df = ticker_df.sort_index()
+        if "Close" not in out.columns:
+            return None
 
-            if "Close" not in ticker_df.columns:
-                continue
+        out = out[["Close"]].copy()
+        out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+        out = out.dropna(subset=["Close"])
 
-            ticker_df = ticker_df[["Close"]].copy()
-            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
-            ticker_df = ticker_df.dropna(subset=["Close"])
+        if out.empty:
+            return None
 
-            if not ticker_df.empty:
-                result[ticker] = ticker_df
+        return out
 
-    else:
-        ticker = tickers[0]
-        ticker_df = hist.copy()
-        ticker_df.index = pd.to_datetime(ticker_df.index)
+    def _extract_download_result(hist: pd.DataFrame, tickers_local: Tuple[str, ...]) -> Dict[str, pd.DataFrame]:
+        result: Dict[str, pd.DataFrame] = {}
 
-        if getattr(ticker_df.index, "tz", None) is not None:
-            ticker_df.index = ticker_df.index.tz_localize(None)
+        if hist is None or hist.empty:
+            return result
 
-        ticker_df = ticker_df.sort_index()
+        # Case 1: MultiIndex columns
+        if isinstance(hist.columns, pd.MultiIndex):
+            lvl0 = list(hist.columns.get_level_values(0))
+            lvl1 = list(hist.columns.get_level_values(1))
 
-        if "Close" in ticker_df.columns:
-            ticker_df = ticker_df[["Close"]].copy()
-            ticker_df["Close"] = pd.to_numeric(ticker_df["Close"], errors="coerce")
-            ticker_df = ticker_df.dropna(subset=["Close"])
+            # Layout A: columns like (ticker, field)
+            if any(t in lvl0 for t in tickers_local):
+                for ticker in tickers_local:
+                    if ticker not in lvl0:
+                        continue
+                    try:
+                        ticker_df = hist[ticker].copy()
+                        ticker_df = _normalize_single_df(ticker_df)
+                        if ticker_df is not None:
+                            result[ticker] = ticker_df
+                    except Exception:
+                        pass
 
-            if not ticker_df.empty:
-                result[ticker] = ticker_df
+            # Layout B: columns like (field, ticker)
+            elif any(t in lvl1 for t in tickers_local):
+                for ticker in tickers_local:
+                    if ticker not in lvl1:
+                        continue
+                    try:
+                        ticker_df = hist.xs(ticker, axis=1, level=1).copy()
+                        ticker_df = _normalize_single_df(ticker_df)
+                        if ticker_df is not None:
+                            result[ticker] = ticker_df
+                    except Exception:
+                        pass
+
+        # Case 2: flat columns => probably single ticker
+        else:
+            if len(tickers_local) == 1:
+                ticker = tickers_local[0]
+                ticker_df = _normalize_single_df(hist.copy())
+                if ticker_df is not None:
+                    result[ticker] = ticker_df
+
+        return result
+
+    def _download_many(tickers_local: Tuple[str, ...], use_threads: bool) -> Dict[str, pd.DataFrame]:
+        try:
+            hist = yf.download(
+                tickers=list(tickers_local),
+                start=start_iso,
+                end=end_iso,
+                interval="1d",
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                group_by="ticker",
+                threads=use_threads,
+            )
+            return _extract_download_result(hist, tickers_local)
+        except Exception:
+            return {}
+
+    def _download_one(ticker: str) -> Optional[pd.DataFrame]:
+        try:
+            hist = yf.download(
+                tickers=ticker,
+                start=start_iso,
+                end=end_iso,
+                interval="1d",
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                threads=False,
+            )
+            return _normalize_single_df(hist)
+        except Exception:
+            return None
+
+    # First try: batch with threads
+    result = _download_many(tickers, use_threads=True)
+
+    # Second try: batch without threads for anything missing
+    missing = [t for t in tickers if t not in result]
+    if missing:
+        retry_result = _download_many(tuple(missing), use_threads=False)
+        result.update(retry_result)
+
+    # Final fallback: one by one for anything still missing
+    missing = [t for t in tickers if t not in result]
+    for ticker in missing:
+        one = _download_one(ticker)
+        if one is not None:
+            result[ticker] = one
 
     return result
-
 
 def align_on_or_after(series: pd.Series, target_date: pd.Timestamp) -> Tuple[pd.Timestamp, float]:
     target_date = pd.Timestamp(target_date).normalize()
@@ -200,7 +264,6 @@ def align_on_or_after(series: pd.Series, target_date: pd.Timestamp) -> Tuple[pd.
     alloc_date = pd.Timestamp(eligible.index[0]).normalize()
     alloc_price = float(eligible.iloc[0])
     return alloc_date, alloc_price
-
 
 def compute_relative_return_percent(value_series: pd.Series, invested_series: pd.Series) -> pd.Series:
     invested = invested_series.astype(float)
@@ -232,11 +295,18 @@ def build_portfolio_and_benchmark_cached(
     )
 
     if SP500_TICKER not in downloaded_map:
-        raise ValueError(f"No Yahoo Finance data returned for benchmark '{SP500_TICKER}'.")
+        raise ValueError(
+            "Yahoo Finance did not return benchmark data for ^GSPC. "
+            "This is usually a temporary Yahoo/Cloud issue. Try Refresh market data again."
+        )
 
     missing_tickers = [t for t in all_tickers if t not in downloaded_map]
     if missing_tickers:
-        raise ValueError(f"No Yahoo Finance data returned for ticker(s): {missing_tickers}")
+        st.warning(f"Some tickers could not be downloaded and were skipped: {missing_tickers}")
+        all_tickers = tuple(t for t in all_tickers if t in downloaded_map)
+
+    if len(all_tickers) <= 1:
+        raise ValueError("No usable asset tickers were downloaded.")
 
     price_map = {ticker: df["Close"].astype(float) for ticker, df in downloaded_map.items()}
 
