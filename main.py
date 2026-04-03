@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -17,8 +18,6 @@ import yfinance as yf
 # ============================================================
 APP_TITLE = "XTB Open Positions vs S&P 500"
 DEFAULT_EXCEL_PATH = "xtb_transactions.xlsx"
-CACHE_DIR = Path("cache_price_data")
-CACHE_DIR.mkdir(exist_ok=True)
 
 XTB_TO_YAHOO_SUFFIX = {
     "BE": "BR",   # Euronext Brussels
@@ -52,6 +51,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def file_hash_from_bytes(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
 def load_excel_bytes_from_path(path_str: str) -> bytes:
     return Path(path_str).read_bytes()
@@ -68,13 +71,11 @@ def find_open_positions_sheet(file_bytes: bytes) -> str:
 
 def xtb_to_yahoo_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
-    suffix_map = dict(XTB_TO_YAHOO_SUFFIX)
-
     if "." not in symbol:
         return symbol
 
     base, suffix = symbol.rsplit(".", 1)
-    yahoo_suffix = suffix_map.get(suffix.upper(), suffix.upper())
+    yahoo_suffix = XTB_TO_YAHOO_SUFFIX.get(suffix.upper(), suffix.upper())
     return f"{base}.{yahoo_suffix}"
 
 
@@ -118,62 +119,21 @@ def load_positions(file_bytes: bytes) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def cache_file_path(ticker: str) -> Path:
-    safe = ticker.replace("^", "__index__").replace("/", "_")
-    return CACHE_DIR / f"{safe}.parquet"
-
-
-def read_cached_close_frame(ticker: str) -> Optional[pd.DataFrame]:
-    cache_path = cache_file_path(ticker)
-    if not cache_path.exists():
-        return None
-
-    try:
-        df = pd.read_parquet(cache_path)
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_localize(None)
-        df = df.sort_index()
-
-        if "Close" not in df.columns:
-            return None
-
-        df = df[["Close"]].copy()
-        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-        df = df.dropna(subset=["Close"])
-        return df
-    except Exception:
-        return None
-
-
-def get_incremental_fetch_start(
-    existing: Optional[pd.DataFrame],
-    requested_start: pd.Timestamp,
-    overlap_days: int = 7,
-) -> pd.Timestamp:
-    requested_start = pd.Timestamp(requested_start).normalize()
-
-    if existing is None or existing.empty:
-        return requested_start
-
-    last_cached = pd.Timestamp(existing.index.max()).normalize()
-    return min(requested_start, last_cached - pd.Timedelta(days=overlap_days))
-
-
-def fetch_tickers_history_batch(
-    tickers: List[str],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def fetch_tickers_history_batch_cached(
+    tickers: Tuple[str, ...],
+    start_iso: str,
+    end_iso: str,
+    refresh_nonce: int,
 ) -> Dict[str, pd.DataFrame]:
-    tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
-    if not tickers:
-        return {}
-
+    """
+    Cached Yahoo download for Streamlit Cloud.
+    refresh_nonce changes only when the user clicks refresh.
+    """
     hist = yf.download(
-        tickers=tickers,
-        start=start.date().isoformat(),
-        end=(end + pd.Timedelta(days=1)).date().isoformat(),
+        tickers=list(tickers),
+        start=start_iso,
+        end=end_iso,
         interval="1d",
         auto_adjust=False,
         actions=False,
@@ -189,7 +149,6 @@ def fetch_tickers_history_batch(
 
     if isinstance(hist.columns, pd.MultiIndex):
         first_level = hist.columns.get_level_values(0)
-
         for ticker in tickers:
             if ticker not in first_level:
                 continue
@@ -211,6 +170,7 @@ def fetch_tickers_history_batch(
 
             if not ticker_df.empty:
                 result[ticker] = ticker_df
+
     else:
         ticker = tickers[0]
         ticker_df = hist.copy()
@@ -228,63 +188,6 @@ def fetch_tickers_history_batch(
 
             if not ticker_df.empty:
                 result[ticker] = ticker_df
-
-    return result
-
-
-def get_price_histories(
-    tickers: List[str],
-    requested_start: pd.Timestamp,
-    allow_download: bool = True,
-) -> Dict[str, pd.Series]:
-    tickers = sorted(set(str(t).strip() for t in tickers if str(t).strip()))
-    requested_start = pd.Timestamp(requested_start).normalize()
-
-    result: Dict[str, pd.Series] = {}
-    cached_data: Dict[str, Optional[pd.DataFrame]] = {}
-
-    for ticker in tickers:
-        cached_data[ticker] = read_cached_close_frame(ticker)
-
-    downloaded_map: Dict[str, pd.DataFrame] = {}
-
-    if allow_download:
-        fetch_starts = [
-            get_incremental_fetch_start(cached_data[ticker], requested_start, overlap_days=7)
-            for ticker in tickers
-        ]
-        batch_fetch_start = min(fetch_starts) if fetch_starts else requested_start
-        batch_fetch_end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None).normalize() + pd.Timedelta(days=2)
-
-        downloaded_map = fetch_tickers_history_batch(
-            tickers=tickers,
-            start=batch_fetch_start,
-            end=batch_fetch_end,
-        )
-
-    for ticker in tickers:
-        frames = []
-
-        existing = cached_data[ticker]
-        if existing is not None and not existing.empty:
-            frames.append(existing)
-
-        downloaded = downloaded_map.get(ticker)
-        if downloaded is not None and not downloaded.empty:
-            frames.append(downloaded)
-
-        if not frames:
-            raise ValueError(f"No Yahoo Finance data returned for ticker '{ticker}'.")
-
-        merged = pd.concat(frames).sort_index()
-        merged = merged[~merged.index.duplicated(keep="last")]
-        merged = merged[merged.index >= requested_start].copy()
-
-        if merged.empty:
-            raise ValueError(f"No usable price history available for '{ticker}'.")
-
-        merged.to_parquet(cache_file_path(ticker))
-        result[ticker] = merged["Close"].astype(float)
 
     return result
 
@@ -309,19 +212,33 @@ def compute_relative_return_percent(value_series: pd.Series, invested_series: pd
     return result
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def build_portfolio_and_benchmark_cached(
     positions_df: pd.DataFrame,
-    allow_download: bool,
+    refresh_nonce: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     overall_start = positions_df["Open date"].min().normalize()
-    all_tickers = sorted(set(positions_df["Yahoo Symbol"].tolist() + [SP500_TICKER]))
+    all_tickers = tuple(sorted(set(positions_df["Yahoo Symbol"].tolist() + [SP500_TICKER])))
 
-    price_map = get_price_histories(
+    start_iso = overall_start.date().isoformat()
+    end_ts = pd.Timestamp.now(tz=NY_TZ).tz_localize(None).normalize() + pd.Timedelta(days=2)
+    end_iso = end_ts.date().isoformat()
+
+    downloaded_map = fetch_tickers_history_batch_cached(
         tickers=all_tickers,
-        requested_start=overall_start,
-        allow_download=allow_download,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        refresh_nonce=refresh_nonce,
     )
+
+    if SP500_TICKER not in downloaded_map:
+        raise ValueError(f"No Yahoo Finance data returned for benchmark '{SP500_TICKER}'.")
+
+    missing_tickers = [t for t in all_tickers if t not in downloaded_map]
+    if missing_tickers:
+        raise ValueError(f"No Yahoo Finance data returned for ticker(s): {missing_tickers}")
+
+    price_map = {ticker: df["Close"].astype(float) for ticker, df in downloaded_map.items()}
 
     calendar_index = price_map[SP500_TICKER].index
     for series in price_map.values():
@@ -333,7 +250,6 @@ def build_portfolio_and_benchmark_cached(
     invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
     benchmark_invested_capital = pd.Series(0.0, index=calendar_index, dtype=float)
     instrument_series = []
-    allocation_rows: List[dict] = []
 
     spx_prices_full = price_map[SP500_TICKER].reindex(calendar_index).ffill()
 
@@ -371,19 +287,6 @@ def build_portfolio_and_benchmark_cached(
         instrument_series.append(asset_component)
         instrument_series.append(bench_component)
 
-        allocation_rows.append(
-            {
-                "Position": position_id,
-                "XTB Symbol": xtb_symbol,
-                "Yahoo Symbol": ticker,
-                "Open date": open_date.date().isoformat(),
-                "Purchase value": purchase_value,
-                "Benchmark allocation date": bench_alloc_date.date().isoformat(),
-                "Benchmark allocation close": round(bench_alloc_price, 6),
-                "Benchmark units": bench_units,
-            }
-        )
-
     instrument_traces = pd.concat(instrument_series, axis=1)
 
     result = pd.DataFrame(
@@ -404,7 +307,6 @@ def build_portfolio_and_benchmark_cached(
         result["S&P 500 Invested"],
     )
 
-    allocation_df = pd.DataFrame(allocation_rows)
     return result, instrument_traces
 
 
@@ -434,20 +336,10 @@ def render_plot_png(
     ax.set_facecolor("none")
 
     if show_portfolio:
-        sns.lineplot(
-            x=history_df.index,
-            y=portfolio_series,
-            ax=ax,
-            label="Portfolio",
-        )
+        sns.lineplot(x=history_df.index, y=portfolio_series, ax=ax, label="Portfolio")
 
     if show_benchmark:
-        sns.lineplot(
-            x=history_df.index,
-            y=benchmark_series,
-            ax=ax,
-            label="S&P 500 equivalent",
-        )
+        sns.lineplot(x=history_df.index, y=benchmark_series, ax=ax, label="S&P 500 equivalent")
 
     ax.set_title(f"{APP_TITLE} — {metric_mode}", color=text_color)
     ax.set_xlabel("Date", color=text_color)
@@ -493,11 +385,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if "refresh_nonce" not in st.session_state:
+    st.session_state["refresh_nonce"] = 0
+
 st.title(APP_TITLE)
 st.caption(
     "Reads currently open positions from the XTB export, downloads daily Yahoo Finance closes "
-    "in batch with yf.download, caches them locally, and compares the portfolio with an S&P 500 investment "
-    "made on each position's open date."
+    "in batch with yf.download, caches them in Streamlit cache, and compares the portfolio with "
+    "an S&P 500 investment made on each position's open date."
 )
 
 with st.sidebar:
@@ -516,12 +411,13 @@ with st.sidebar:
     show_portfolio = st.checkbox("Show portfolio", value=True)
     show_benchmark = st.checkbox("Show S&P 500 equivalent", value=True)
 
-    refresh_prices = st.button("Refresh market data")
-    clear_cache = st.button("Clear all caches")
+    if st.button("Refresh market data"):
+        st.session_state["refresh_nonce"] += 1
 
-if clear_cache:
-    st.cache_data.clear()
-    st.success("Streamlit cache cleared.")
+    if st.button("Clear Streamlit cache"):
+        st.cache_data.clear()
+        st.session_state["refresh_nonce"] = 0
+        st.success("Cache cleared.")
 
 file_bytes: Optional[bytes] = None
 file_name_to_show = None
@@ -537,11 +433,13 @@ else:
     else:
         st.error(
             "No file uploaded and default Excel file was not found. "
-            f"Expected default file: {excel_file.resolve() if excel_file.is_absolute() else excel_file}"
+            f"Expected default file: {excel_file}"
         )
         st.stop()
 
 st.sidebar.caption(f"Using file: {file_name_to_show}")
+st.sidebar.caption(f"File hash: {file_hash_from_bytes(file_bytes)[:12]}")
+st.sidebar.caption(f"Refresh version: {st.session_state['refresh_nonce']}")
 
 try:
     positions_df = load_positions(file_bytes)
@@ -557,20 +455,16 @@ try:
     with st.spinner("Building portfolio history...", show_time=True):
         history_df, instrument_df = build_portfolio_and_benchmark_cached(
             positions_df=positions_df,
-            allow_download=refresh_prices,
+            refresh_nonce=st.session_state["refresh_nonce"],
         )
 except Exception as e:
     st.exception(e)
     st.stop()
 
-if history_df is None or history_df.empty:
+if history_df.empty:
     st.warning("No time series could be built from the available positions and market data.")
     st.stop()
 
-
-# -------------------------------------------------
-# Plot
-# -------------------------------------------------
 text_color = "white"
 
 plot_png = render_plot_png(
@@ -582,7 +476,6 @@ plot_png = render_plot_png(
 )
 
 st.image(plot_png, use_container_width=True)
-
 
 # ============================================================
 # Summary metrics
